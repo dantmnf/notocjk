@@ -1,11 +1,14 @@
 import logging
-import shutil
 from os import PathLike
 from pathlib import Path
+from concurrent.futures import Executor
+import asyncio
+from contextlib import AbstractAsyncContextManager, nullcontext
 
 import chws_tool
 import httpx
 from fontTools import ttLib
+from fontTools.varLib import instancer
 from nototools import font_data, tool_utils
 from tqdm import tqdm
 
@@ -60,74 +63,131 @@ ANDROID_EMOJI = {
 CONTROL_CHARS = set(tool_utils.parse_int_ranges("0000-001F"))
 EXCLUDED_CODEPOINTS = frozenset(sorted(EMOJI_IN_CJK | ANDROID_EMOJI | CONTROL_CHARS))
 
-
-def remove_codepoints_from_ttc(ttc_path, out_dir):
-    """Removes a set of characters from a TTC font file's cmap table."""
-    logging.info("Loading %s", ttc_path)
-    ttc = ttLib.TTCollection(ttc_path)
-    logging.info("Subsetting %d fonts in the collection", len(ttc))
-    for font in ttc:
-        font_data.delete_from_cmap(font, EXCLUDED_CODEPOINTS)
-    out_path = out_dir / ttc_path.name
-    logging.info("Saving to %s", out_path)
-    ttc.save(out_path)
-    logging.info(
-        "Size: %d --> %d, delta=%d",
-        ttc_path.stat().st_size,
-        out_path.stat().st_size,
-        out_path.stat().st_size - ttc_path.stat().st_size,
-    )
-
-
 ## END: https://android.googlesource.com/platform/external/noto-fonts.git/+/refs/heads/android15-release/scripts/subset_noto_cjk.py
 
+def ensure_parent_dir(path: PathLike):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-def download_file(
-    url: str, save_path_file_name: str | bytes | PathLike[str] | PathLike[bytes]
+def process_ttf_worker(in_ttf, out_ttf, temp_dir):
+    """
+    Apply CHWS patch to a font file.
+    Remove a set of characters from font file's cmap table.
+    Instantiate wght=400 as default instance for variable fonts.
+    """
+    chws_output = Path(temp_dir) / "intermediate_chws" / Path(in_ttf).name
+    ensure_parent_dir(chws_output)
+    print(f"  ADD_CHWS\t{in_ttf}")
+    chws_tool.add_chws(in_ttf, chws_output)
+
+    print(f"  SUBSET\t{chws_output}")
+    font = ttLib.TTFont(chws_output)
+    font_data.delete_from_cmap(font, EXCLUDED_CODEPOINTS)
+
+    if 'fvar' in font:
+        # drop VORG from font as it is optional and not handled in fontTools.varLib.instancer (yet)
+        # ref: https://learn.microsoft.com/en-us/typography/opentype/spec/vorg
+        print(f"  VFINST\t{chws_output}")
+        del font['VORG']
+        font['VVAR'].table.VOrgMap = None
+        instancer.instantiateVariableFont(font, {'wght':(100, 400, 900)}, inplace=True, updateFontNames=False)
+
+    print(f"  TTF\t{out_ttf}")
+    ensure_parent_dir(out_ttf)
+    font.save(out_ttf)
+
+
+async def download_file(
+    url: str, save_path_file_name: PathLike,
+    actx: AbstractAsyncContextManager | None = None
 ) -> bool:
-    with open(save_path_file_name, "wb") as f:
-        with httpx.stream("GET", url, follow_redirects=True) as response:
-            if response.status_code != 200:
-                logging.error(f"Failed to download {url}")
-                return False
-            with tqdm(
-                total=int(response.headers.get("content-length", 0)),
-                unit="B",
-                unit_divisor=1024,
-                unit_scale=True,
-            ) as progress:
-                num_bytes_downloaded = response.num_bytes_downloaded
-                for chunk in response.iter_bytes():
-                    f.write(chunk)
-                    progress.update(
-                        response.num_bytes_downloaded - num_bytes_downloaded
-                    )
-                    num_bytes_downloaded = response.num_bytes_downloaded
+    async with (actx if actx is not None else nullcontext()):
+        print(f"  FETCH\t{save_path_file_name}")
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url, follow_redirects=True) as response:
+                if response.status_code != 200:
+                    logging.error(f"Failed to download {url}")
+                    return False
+                with tqdm(
+                    total=int(response.headers.get("content-length", 0)),
+                    unit="B",
+                    unit_divisor=1024,
+                    unit_scale=True,
+                ) as progress:
+                    ensure_parent_dir(save_path_file_name)
+                    with open(save_path_file_name, "wb") as f:
+                        num_bytes_downloaded = response.num_bytes_downloaded
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
+                            progress.update(
+                                response.num_bytes_downloaded - num_bytes_downloaded
+                            )
+                            num_bytes_downloaded = response.num_bytes_downloaded
     return True
 
 
-def download_and_patch_noto_cjk_font(url):
-    base_file_name = url.split("/")[-1]
-    ## Download
-    logging.info(f"Downloading {url}...")
-    input_dir = Path("temp/input")
-    input_dir.mkdir(parents=True, exist_ok=True)
-    input_file = input_dir / base_file_name
-    if not download_file(url, input_file):
-        logging.error("Failed to download")
-        return
+def unpack_ttc_worker(in_ttc: PathLike, index, out_file: PathLike):
+    print(f"  UNTTC\t{in_ttc} -> {out_file}")
+    ttc = ttLib.TTCollection(in_ttc)
+    font = ttc[index]
+    ensure_parent_dir(out_file)
+    font.save(out_file)
 
-    ## CHWS Patch
-    logging.info("Applying CHWS patch...")
-    output_path = Path("temp/chws_output")
-    output_path.mkdir(exist_ok=True)
-    output_file = output_path / base_file_name
-    chws_tool.add_chws(input_file, output_file)
 
-    ## Subset
-    logging.info("Subsetting...")
-    result_path = Path("system/fonts")
-    result_path.mkdir(parents=True, exist_ok=True)
-    remove_codepoints_from_ttc(output_file, result_path)
-    logging.info("Done!")
-    shutil.rmtree(Path("temp"))
+async def unpack_ttc(executor: Executor, in_ttc: PathLike, out_dir: PathLike) -> list[Path]:
+    loop = asyncio.get_event_loop()
+    out_ttfs = []
+    print(f"  UNTTC\t{in_ttc}")
+    ttc = ttLib.TTCollection(in_ttc)
+    futures = []
+    for i in range(len(ttc)):
+        ttf_out = Path(out_dir) / (Path(in_ttc).name + f"#{i}.ttf")
+        out_ttfs.append(ttf_out)
+        futures.append(loop.run_in_executor(executor, unpack_ttc_worker, in_ttc, i, ttf_out))
+    await asyncio.gather(*futures)
+    return out_ttfs
+
+
+def pack_ttc(ttfs: list[PathLike], out_ttc: PathLike):
+    print(f"  TTC\t{out_ttc}")
+    ttc = ttLib.TTCollection()
+    for ttf in ttfs:
+        ttc.fonts.append(ttLib.TTFont(ttf))
+    ensure_parent_dir(out_ttc)
+    ttc.save(out_ttc)
+
+
+def is_ttc(file_path: PathLike) -> bool:
+    with open(file_path, "rb") as f:
+        return f.read(4) == b"ttcf"
+
+
+async def process_ttf(executor: Executor, in_ttf: PathLike, out_ttf: PathLike, temp_dir: PathLike):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, process_ttf_worker, in_ttf, out_ttf, temp_dir)
+
+
+async def process_ttc(executor: Executor, in_ttc: PathLike, out_ttc: PathLike, temp_dir: PathLike):
+    loop = asyncio.get_event_loop()
+    out_ttfs = []
+    ttc = ttLib.TTCollection(in_ttc)
+
+    async def unpack_and_process_ttf(in_ttc, index, ttf_out):
+        input_ttf = Path(temp_dir) / "input_ttf" / (Path(in_ttc).name + f"#{index}.ttf")
+        await loop.run_in_executor(executor, unpack_ttc_worker, in_ttc, index, input_ttf)
+        await process_ttf(executor, input_ttf, ttf_out, temp_dir)
+
+    coros = []
+    for i in range(len(ttc)):
+        ttf_out = Path(temp_dir) / "processed_ttf" / (Path(in_ttc).name + f"#{i}.ttf")
+        out_ttfs.append(ttf_out)
+        coros.append(unpack_and_process_ttf(in_ttc, i, ttf_out))
+
+    await asyncio.gather(*coros)
+    await loop.run_in_executor(executor, pack_ttc, out_ttfs, out_ttc)
+
+
+async def process_font(executor: Executor, in_font: PathLike, out_font: PathLike, temp_dir: PathLike):
+    if is_ttc(in_font):
+        await process_ttc(executor, in_font, out_font, temp_dir)
+    else:
+        await process_ttf(executor, in_font, out_font, temp_dir)
