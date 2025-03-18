@@ -29,7 +29,7 @@ async def main():
     download_sem = asyncio.Semaphore(2)
     temp_dir = Path("temp")
 
-    executor = concurrent.futures.ProcessPoolExecutor()
+    executor = concurrent.futures.ProcessPoolExecutor(max_tasks_per_child=1)
 
     async def download_and_process_file(url: str):
         base_file_name = urllib.parse.urlparse(url).path.split("/")[-1]

@@ -133,20 +133,6 @@ def unpack_ttc_worker(in_ttc: PathLike, index, out_file: PathLike):
     font.save(out_file)
 
 
-async def unpack_ttc(executor: Executor, in_ttc: PathLike, out_dir: PathLike) -> list[Path]:
-    loop = asyncio.get_event_loop()
-    out_ttfs = []
-    print(f"  UNTTC\t{in_ttc}")
-    ttc = ttLib.TTCollection(in_ttc)
-    futures = []
-    for i in range(len(ttc)):
-        ttf_out = Path(out_dir) / (Path(in_ttc).name + f"#{i}.ttf")
-        out_ttfs.append(ttf_out)
-        futures.append(loop.run_in_executor(executor, unpack_ttc_worker, in_ttc, i, ttf_out))
-    await asyncio.gather(*futures)
-    return out_ttfs
-
-
 def pack_ttc(ttfs: list[PathLike], out_ttc: PathLike):
     print(f"  TTC\t{out_ttc}")
     ttc = ttLib.TTCollection()
