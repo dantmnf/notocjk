@@ -43,6 +43,7 @@ async def main():
         futures.append(download_file("https://github.com/topjohnwu/Magisk/raw/master/scripts/module_installer.sh", "META-INF/com/google/android/update-binary"))
 
     await asyncio.gather(*futures)
+    executor.shutdown()
     shutil.rmtree(temp_dir)
 
 
