@@ -18,7 +18,7 @@ jobs:
     - run: poetry install
     - name: Run python script
       run: |
-        poetry run python -m chws_subset
+        poetry run python -m chws_subset -j 2
     - name: Make release zip
       run: |
         zip -9 -x "*.git*" -x "chws_subset*" -x "extra*" -x "poetry.lock" -x "pyproject.toml" -r notocjk.zip ./

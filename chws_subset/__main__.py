@@ -18,6 +18,7 @@ async def main():
         description="Download and patch Noto fonts with CHWS"
     )
     parser.add_argument("--url", help="URL to download and patch", default=None)
+    parser.add_argument("-j", "--jobs", help="Number of parallel jobs", type=int, default=None)
     args = parser.parse_args()
     build_module = True
     if args.url:
@@ -29,7 +30,7 @@ async def main():
     download_sem = asyncio.Semaphore(2)
     temp_dir = Path("temp")
 
-    executor = concurrent.futures.ProcessPoolExecutor(max_tasks_per_child=1)
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs, max_tasks_per_child=1)
 
     async def download_and_process_file(url: str):
         base_file_name = urllib.parse.urlparse(url).path.split("/")[-1]
